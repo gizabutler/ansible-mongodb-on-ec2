@@ -1,0 +1,178 @@
+# AWS playbook
+---
+
+- hosts: localhost
+  connection: local
+  gather_facts: False
+
+  vars:
+    key_name: my_aws             # Key used for SSH
+    region: us-east-1     # Region may affect response and pricing
+    image: ami-051f8a213df8bc089 # look in ec2 > ami (filter owner alias: amazon) or amis of manually launched instances
+    id: "example testing"
+    instance_type: t3a.medium       # Choose instance type, check AWS for pricing
+    vpc_subnet_id: "subnet-cce53ce7"
+    vpc_id: vpc-32750857
+    sec_group: "test-security-group"
+    instance_profile: "arn:aws:iam::237946030049:instance-profile/test-mongodb"
+
+  tasks:
+
+    - name: Create security group
+      amazon.aws.ec2_security_group:
+        name: "{{ sec_group }}"
+        description: "Sec group for app"
+        region: "{{ region }}"
+        vpc_id: "{{ vpc_id }}"
+        # aws_access_key: "{{ec2_access_key}}"  # From vault as defined
+        # aws_secret_key: "{{ec2_secret_key}}"  # From vault as defined
+        rules:                                # allows ssh on port 22
+          - proto: tcp
+            ports:
+              - 22
+            cidr_ip: 0.0.0.0/0
+            rule_desc: allow all on ssh port
+          - proto: tcp
+            ports:
+              - 27017
+            cidr_ip: 0.0.0.0/0
+            rule_desc: allow all on mongodb port
+
+    - name: Amazon EC2 | Create Key Pair      # Create key pair for ssh
+      amazon.aws.ec2_key:
+        name: "{{ key_name }}"
+        region: "{{ region }}"
+        # aws_access_key: "{{ec2_access_key}}"  # From vault as defined
+        # aws_secret_key: "{{ec2_secret_key}}"  # From vault as defined
+        key_material: "{{ item }}"
+      with_file: ~/.ssh/id_rsa.pub
+
+    - name: Start an instance with a public IP address
+      amazon.aws.ec2_instance:
+        name: "public-compute-instance"
+        key_name: "{{ key_name }}"
+        vpc_subnet_id: "{{ vpc_subnet_id }}"
+        instance_type: "{{ instance_type }}"
+        security_group: "{{ sec_group }}"
+        iam_instance_profile: "{{ instance_profile }}"
+        # aws_access_key: "{{ ec2_access_key }}"
+        # aws_secret_key: "{{ ec2_secret_key }}"
+        region: "{{ region }}"
+        network:
+          assign_public_ip: true
+        image_id: "{{ image }}"
+        tags:
+          Environment: Testing
+      register: ec2
+    
+
+    - name: Instances IP
+      debug:
+        msg: "{{ item.public_ip_address }}"
+      loop: "{{ ec2.instances }}"
+      tags: always
+
+    - name: Instances ID
+      set_fact:
+        instance_id: "{{ item.instance_id }}"
+      loop: "{{ ec2.instances }}"
+
+    - name: Add new instance to host group
+      add_host:
+        hostname: "{{ item.public_ip_address }}"
+        groupname: mongodb
+      loop: "{{ ec2.instances }}"
+
+    - name: Wait for SSH to come up
+      wait_for:
+        host: "{{ item.public_dns_name }}"
+        port: 22
+        state: started
+      loop: "{{ ec2.instances }}"
+
+- hosts: mongodb
+  gather_facts: no
+  become: true
+  vars:
+    ansible_user: ec2-user
+  tasks:
+      - name: Add repository
+        ansible.builtin.yum_repository:
+          name: mongodb-org-7.0
+          description: mongodb-org-7.0
+          baseurl: https://repo.mongodb.org/yum/amazon/2023/mongodb-org/7.0/x86_64/
+          gpgkey: https://pgp.mongodb.com/server-7.0.asc
+
+      - name: upgrade all packages
+        dnf:
+          name: "*"
+          state: latest
+
+      - name: Install mongodb
+        ansible.builtin.dnf:
+          name:
+            - mongodb-org
+            - mongodb-mongosh-shared-openssl3
+            - cronie
+          state: present
+
+      - name: Enable service mongodb and ensure it is not masked
+        systemd:
+          name: mongod
+          enabled: true
+          masked: no
+
+      - name: Copy mongod.conf to remote machine
+        copy:
+          src: roles/mongo/files/mongod.conf
+          dest: /etc/mongod.conf
+
+      - name: Copy mongod.conf to remote machine
+        copy:
+          src: roles/mongo/files/users.js
+          dest: /opt/users.js
+
+      - name: Restart service mongod also issue daemon-reload to pick up config changes
+        systemd:
+          state: restarted
+          daemon_reload: true
+          name: mongod
+      
+      - name: Run a command that uses non-posix shell-isms (in this example /bin/sh doesn't handle redirection and wildcards together but bash does)
+        ansible.builtin.shell: mongosh < /opt/users.js
+        args:
+          executable: /bin/bash
+
+      - name: Restart service mongod also issue daemon-reload to pick up config changes
+        systemd:
+          state: restarted
+          daemon_reload: true
+          name: mongod
+
+- hosts: localhost
+  connection: local
+  vars:
+    instance_id: "{{ instance_id }}" # Replace with your instance ID
+    ami_name: mongodb
+    description: Mongodb on Amazon Linux 2023
+    region: us-east-1 # Replace with your preferred region
+    tags:
+      Name: mongodb
+  tasks:
+    - name: Create AMI
+      ec2_ami:
+        instance_id: "{{ instance_id }}"
+        name: "{{ ami_name }}-{{ ansible_date_time.date }}"
+        description: "{{ description }}"
+        region: "{{ region }}"
+        tags: "{{ tags }}"
+        wait: true
+      register: ami
+    - name: Terminate instance
+      amazon.aws.ec2_instance:
+        state: absent
+        instance_ids:
+          - "{{ instance_id }}"
+    - name: Display AMI ID
+      debug:
+        msg: "AMI ID is {{ ami.image_id }}"
